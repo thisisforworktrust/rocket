@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8"/>
-<title>Velocity Void — Merged & Fixed</title>
+<title>Velocity Void — Stacked Upgrades</title>
 <style>
   html,body{height:100%;margin:0;background:#030417;color:#dfefff;font-family:monospace;overflow:hidden}
   canvas{display:block}
@@ -24,6 +24,7 @@
   #msg{position:fixed;right:12px;top:12px;color:#cfefff;font-size:13px}
   #gameOver{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);color:#fff;font-size:28px;z-index:12;display:none}
   button { cursor:pointer; }
+  .upgradesSummary { margin-top:8px; font-size:12px; color:#9fb7c8; }
 </style>
 </head>
 <body>
@@ -32,6 +33,7 @@
   <div id="killsUi">Kills: 0</div>
   <div id="boostUi">Boost: READY</div>
   <div id="metaUi">Max Missiles: 3 | Missile Speed Bonus: 0.00</div>
+  <div class="upgradesSummary" id="upgradesUi">Upgrades: —</div>
 </div>
 
 <div id="overlay"><div id="panel">
@@ -60,6 +62,7 @@ const ammoUi = document.getElementById('ammoUi');
 const killsUi = document.getElementById('killsUi');
 const boostUi = document.getElementById('boostUi');
 const metaUi = document.getElementById('metaUi');
+const upgradesUi = document.getElementById('upgradesUi');
 const gameOverEl = document.getElementById('gameOver');
 
 let keys = {};
@@ -74,13 +77,12 @@ let killsSinceLevel = 0;
 let level = 1;
 
 /* player */
-const PLAYER_MAX_SPEED = 5;      // lowered to fix "player too fast"
+const PLAYER_MAX_SPEED = 5;
 let rocket = {
   x: canvas.width/2, y: canvas.height/2,
   vx: 0, vy: 0, angle: 0,
   thrustBase: 0.26, rotationSpeed: 0.07, drag: 0.99,
-  thrustApplied: 0,         // ramping thrust value
-  thrustRampTime: 0.18     // seconds to reach full thrust
+  thrustApplied: 0, thrustRampTime: 0.18
 };
 
 /* magazine & reload */
@@ -109,23 +111,25 @@ let missiles = [];
 
 /* missile cap & scaling */
 let startingMissileCap = 3;
-let missileCap = startingMissileCap;          // current allowed count
-const missileCapMax = 15;                     // hard cap
-let baseDifficultySpeedBonus = 0;             // increases every 5 kills
+let missileCap = startingMissileCap;
+const missileCapMax = 15;
+let baseDifficultySpeedBonus = 0;
 
-/* upgrade state */
+/* upgrade state (counters) */
 let upgrades = {
-  multishot:false,
-  bigger:false,
-  fasterFire:false,
-  homingBullets:false,
-  piercing:false
+  multishot: 0,       // +1 bullet per level
+  bigger: 0,          // +10% size & +10 life per level
+  fasterFire: 0,      // multiplicative ×0.85 per level, min 60ms
+  homingBullets: 0,   // +0.06 steering per level
+  piercing: 0,        // +1 pierce per level
+  addAmmo: 0,         // +1 loaded ammo when picked
+  addMaxAmmo: 0       // +2 magSize per pick
 };
 
 /* missile types base speeds */
 const BASE_TYPE_SPEED = { basic:2.4, burner:3.4, smart:2.6, cluster:2.2 };
 
-/* starfield for background */
+/* starfield */
 let starCanvas = null;
 function makeStars(){
   starCanvas = document.createElement('canvas');
@@ -149,7 +153,7 @@ function clamp(n,a,b){ return Math.max(a, Math.min(b,n)); }
    Spawning & Difficulty
    ------------------------- */
 let spawnTimer = 0;
-const BASE_SPAWN_INTERVAL = 0.6; // seconds
+const BASE_SPAWN_INTERVAL = 0.6;
 
 function pickMissileType(){
   const r = Math.random();
@@ -160,7 +164,7 @@ function pickMissileType(){
 }
 
 function spawnMissile(){
-  if(missiles.length >= missileCap) return; // enforce cap
+  if(missiles.length >= missileCap) return;
   const side = Math.floor(Math.random()*4);
   let x,y;
   if(side===0){ x=-60; y=rand(0,canvas.height); }
@@ -169,7 +173,6 @@ function spawnMissile(){
   else { x=rand(0,canvas.width); y=canvas.height+60; }
   const type = pickMissileType();
   const baseSpeed = BASE_TYPE_SPEED[type];
-  // scale missile speed with difficulty bonus
   const speed = baseSpeed + baseDifficultySpeedBonus;
   missiles.push({ x,y, vx:0, vy:0, type, speed, age:0 });
 }
@@ -183,30 +186,40 @@ function startReload(){
   setTimeout(()=>{ bulletsInMag = magSize; reloading = false; updateUI(); }, reloadTime);
 }
 
+function computeFireRate(){
+  const rate = Math.round(BASE_FIRE_RATE * Math.pow(0.85, upgrades.fasterFire));
+  return Math.max(60, rate);
+}
+
 function shootNow(){
   const now = performance.now();
+  fireRate = computeFireRate();
   if(now - lastShotTime < fireRate) return;
   if(reloading) return;
   if(bulletsInMag <= 0){ startReload(); return; }
   lastShotTime = now;
 
-  // recoil: small impulse opposite shot direction
-  const shots = upgrades.multishot ? 2 : 1;
-  const spread = upgrades.multishot ? 0.12 : 0;
-  const baseBulletSpeed = upgrades.bigger ? 16 : 12;
+  // multishot: 1 + upgrades.multishot
+  const shots = 1 + upgrades.multishot;
+  // spread grows lightly with more shots
+  const spread = shots > 1 ? Math.min(0.28, 0.08 + (shots-1)*0.06) : 0;
+
+  // base bullet speed slightly increased by bigger (small feel change)
+  const baseBulletSpeed = 12 + upgrades.bigger * 1.2;
+  const baseLife = 90 + upgrades.bigger * 10;
   for(let i=0;i<shots;i++){
-    const t = shots===1 ? 0.5 : i/(shots-1 || 1);
+    const t = shots===1 ? 0.5 : (i/(shots-1 || 1));
     const a = rocket.angle + ( (t-0.5) * spread ) * (Math.random()*0.9 + 0.1);
     bullets.push({
       x: rocket.x + Math.cos(a)*22,
       y: rocket.y + Math.sin(a)*22,
       vx: Math.cos(a)*baseBulletSpeed,
       vy: Math.sin(a)*baseBulletSpeed,
-      life: 90,
-      piercing: upgrades.piercing,
-      homing: upgrades.homingBullets
+      life: baseLife,
+      pierce: upgrades.piercing,              // how many extra missiles it can pass through
+      homing: upgrades.homingBullets > 0
     });
-    // Apply recoil per shot (smaller for multishot to keep feel)
+    // recoil per shot (smaller with multishot)
     const recoilStrength = 0.65 * (baseBulletSpeed / 12) * (shots === 1 ? 1 : 0.55);
     rocket.vx -= Math.cos(a) * recoilStrength;
     rocket.vy -= Math.sin(a) * recoilStrength;
@@ -221,28 +234,32 @@ function shootNow(){
    Upgrades / Leveling
    ------------------------- */
 const ALL_UPGRADES = [
-  { id:'multishot', name:'Multi-shot', desc:'Fire two shots at once' },
-  { id:'bigger', name:'Bigger Bullets', desc:'Bullets travel farther & hitbox bigger' },
-  { id:'fasterFire', name:'Faster Fire Rate', desc:'Decrease time between shots' },
-  { id:'homingBullets', name:'Homing Bullets', desc:'Bullets curve toward missiles' },
-  { id:'piercing', name:'Piercing Shot', desc:'Bullets pierce one extra missile' }
+  { id:'multishot', name:'Multi-shot', desc:'Add +1 bullet per upgrade' },
+  { id:'bigger', name:'Bigger Bullets', desc:'+10% size & +10 range per upgrade' },
+  { id:'fasterFire', name:'Faster Fire Rate', desc:'Each upgrade reduces delay by 15%' },
+  { id:'homingBullets', name:'Homing Bullets', desc:'Bullets curve toward missiles (stronger each upgrade)' },
+  { id:'piercing', name:'Piercing Shot', desc:'+1 pierce per upgrade' },
+  { id:'addAmmo', name:'+Ammo', desc:'Add +1 loaded ammo (not above magazine size)' },
+  { id:'addMaxAmmo', name:'Increase Mag Size', desc:'+2 magazine size per upgrade' }
 ];
 
 function offerUpgrade(){
   pausedForUpgrade = true;
   overlay.classList.add('show');
   choicesEl.innerHTML = '';
+  // pool and prefer lower-level upgrades (so unpicked options appear more)
   let pool = [...ALL_UPGRADES];
-  pool.sort((a,b)=> (upgrades[a.id]?1:0) - (upgrades[b.id]?1:0));
+  pool.sort((a,b)=> ( (upgrades[a.id]||0) - (upgrades[b.id]||0) ));
   const opts = [];
   while(opts.length < 3 && pool.length){
     const idx = Math.floor(Math.random()*pool.length);
     opts.push(pool.splice(idx,1)[0]);
   }
   opts.forEach(o=>{
+    const lvl = upgrades[o.id] || 0;
     const div = document.createElement('div');
     div.className = 'choice';
-    div.innerHTML = `<h3>${o.name}</h3><div class="small">${o.desc}</div>`;
+    div.innerHTML = `<h3>${o.name} ${lvl>0?`(Lv ${lvl})` : ''}</h3><div class="small">${o.desc}</div>`;
     div.onclick = ()=>{
       applyUpgrade(o.id);
       overlay.classList.remove('show');
@@ -253,11 +270,28 @@ function offerUpgrade(){
 }
 
 function applyUpgrade(id){
-  if(id === 'multishot') upgrades.multishot = true;
-  if(id === 'bigger') { upgrades.bigger = true; magSize = Math.min(18, magSize + 2); bulletsInMag = Math.min(bulletsInMag, magSize); }
-  if(id === 'fasterFire') { upgrades.fasterFire = true; fireRate = Math.max(60, Math.floor(BASE_FIRE_RATE * 0.6)); }
-  if(id === 'homingBullets') upgrades.homingBullets = true;
-  if(id === 'piercing') upgrades.piercing = true;
+  // increase the counter
+  upgrades[id] = (upgrades[id] || 0) + 1;
+
+  // handle immediate or computed effects
+  if(id === 'addMaxAmmo'){
+    // increase magazine size immediately by +2 (cap to some reasonable max)
+    magSize = Math.min(40, magSize + 2);
+    // if we just increased magSize, give a small ammo boost
+    bulletsInMag = Math.min(magSize, bulletsInMag + 1);
+  }
+
+  if(id === 'addAmmo'){
+    // add 1 loaded ammo right away, but not beyond magSize
+    bulletsInMag = Math.min(magSize, bulletsInMag + 1);
+  }
+
+  if(id === 'fasterFire'){
+    // recompute fireRate using computeFireRate()
+    fireRate = computeFireRate();
+  }
+
+  // update UI
   updateUI();
 }
 
@@ -265,17 +299,20 @@ function applyUpgrade(id){
    Collisions & Game Logic
    ------------------------- */
 function bulletHitsMissile(b,m){
-  const hitRadius = (m.type==='cluster'?18:16) + (upgrades.bigger?2:0);
+  // missile base hit radius
+  const baseHit = (m.type==='cluster'?18:16);
+  // bigger increases bullet effective hit by 10% size per level — simpler: add +2 px per bigger level
+  const extra = upgrades.bigger * 2;
+  const hitRadius = baseHit + extra;
   return Math.hypot(b.x - m.x, b.y - m.y) < hitRadius;
 }
 
 function updateDifficultyAndLevel(){
-  // every 5 kills: increase missile cap by 1 up to missileCapMax and give a small speed bump
+  // every 5 kills increases missile cap and difficulty speed
   if(killCount > 0 && killCount % 5 === 0){
     missileCap = Math.min(missileCap + 1, missileCapMax);
     baseDifficultySpeedBonus += 0.25;
   }
-  // Every 5 kills also triggers level-up upgrade selection
   if(killsSinceLevel >= 5){
     killsSinceLevel = 0;
     level++;
@@ -303,17 +340,14 @@ function update(dt){
   if(keys['ArrowLeft']) rocket.angle -= rocket.rotationSpeed;
   if(keys['ArrowRight']) rocket.angle += rocket.rotationSpeed;
 
-  // thrust ramping: take time to spool up
+  // thrust ramping
   if(keys['ArrowUp']){
-    // increase thrustApplied toward thrustBase over thrustRampTime
     const target = rocket.thrustBase;
     const step = target * (dt / rocket.thrustRampTime);
     rocket.thrustApplied = clamp(rocket.thrustApplied + step, 0, target);
-    // apply thrust using thrustApplied
     rocket.vx += Math.cos(rocket.angle) * rocket.thrustApplied;
     rocket.vy += Math.sin(rocket.angle) * rocket.thrustApplied;
   } else {
-    // ramp down smoothly
     const step = rocket.thrustBase * (dt / rocket.thrustRampTime);
     rocket.thrustApplied = clamp(rocket.thrustApplied - step, 0, rocket.thrustBase);
   }
@@ -321,7 +355,7 @@ function update(dt){
   // braking
   if(keys['ArrowDown']) { rocket.vx *= 0.96; rocket.vy *= 0.96; }
 
-  // shooting
+  // shooting (support hold-fire)
   if(keys['Space'] && !pausedForUpgrade) shootNow();
 
   // boost charge
@@ -342,7 +376,7 @@ function update(dt){
     boostCharge = 0;
   }
 
-  // apply drag then cap speed
+  // drag and cap speed
   rocket.vx *= rocket.drag; rocket.vy *= rocket.drag;
   let speed = Math.hypot(rocket.vx, rocket.vy);
   if(speed > PLAYER_MAX_SPEED){
@@ -352,7 +386,7 @@ function update(dt){
 
   rocket.x += rocket.vx; rocket.y += rocket.vy;
 
-  // wrap player
+  // wrap
   if(rocket.x < 0) rocket.x = canvas.width;
   if(rocket.x > canvas.width) rocket.x = 0;
   if(rocket.y < 0) rocket.y = canvas.height;
@@ -369,9 +403,11 @@ function update(dt){
       if(nearest){
         const dx = nearest.x - b.x, dy = nearest.y - b.y;
         const d = Math.hypot(dx,dy) || 1;
-        b.vx += (dx/d) * 0.12; b.vy += (dy/d) * 0.12;
+        const homingPower = 0.12 + (upgrades.homingBullets * 0.06);
+        b.vx += (dx/d) * homingPower;
+        b.vy += (dy/d) * homingPower;
         const mag = Math.hypot(b.vx, b.vy) || 1;
-        const sp = upgrades.bigger ? 16 : 12;
+        const sp = 12 + upgrades.bigger * 1.2;
         b.vx = (b.vx / mag) * sp;
         b.vy = (b.vy / mag) * sp;
       }
@@ -380,9 +416,9 @@ function update(dt){
   }
 
   // remove bullets offscreen or expired
-  bullets = bullets.filter(b => b.life > 0 && b.x >= 0 && b.x <= canvas.width && b.y >= 0 && b.y <= canvas.height);
+  bullets = bullets.filter(b => b.life > 0 && b.x >= -40 && b.x <= canvas.width+40 && b.y >= -40 && b.y <= canvas.height+40);
 
-  // spawn missiles over time (respect spawn cap)
+  // spawn missiles
   spawnTimer += dt;
   const spawnInterval = Math.max(0.25, BASE_SPAWN_INTERVAL - baseDifficultySpeedBonus * 0.03);
   if(spawnTimer > spawnInterval){
@@ -390,7 +426,7 @@ function update(dt){
     spawnMissile();
   }
 
-  // missile AI update
+  // missile AI
   for(let m of missiles){
     m.age += dt;
     const dx = rocket.x - m.x, dy = rocket.y - m.y;
@@ -441,11 +477,14 @@ function update(dt){
     for(let j = bullets.length - 1; j >= 0; j--){
       const b = bullets[j];
       if(bulletHitsMissile(b,m)){
-        if(b.piercing){
+        // handle piercing: if bullet has pierce (count), decrement and reduce life; otherwise kill bullet
+        if(b.pierce && b.pierce > 0){
+          b.pierce--;
           b.life -= 20;
         } else {
           b.life = -1;
         }
+
         // cluster spawn babies
         if(m.type === 'cluster'){
           for(let k=0;k<3;k++){
@@ -460,6 +499,7 @@ function update(dt){
             });
           }
         }
+
         missiles.splice(i,1);
         killCount++; killsSinceLevel++;
         updateDifficultyAndLevel();
@@ -469,13 +509,15 @@ function update(dt){
     }
   }
 
-  // bullets can hit player (self-hit)
+  // bullets can hit player (self-hit) - scale radius with bigger
+  const selfHitRadius = 14 * (1 + 0.10 * upgrades.bigger);
   for(let b of bullets){
-    if(len(b.x - rocket.x, b.y - rocket.y) < (upgrades.bigger ? 18 : 14)){
+    if(len(b.x - rocket.x, b.y - rocket.y) < selfHitRadius){
       onDeath();
       return;
     }
   }
+
   // missiles hit player
   for(let m of missiles){
     if(len(m.x - rocket.x, m.y - rocket.y) < 22){
@@ -521,9 +563,11 @@ function render(){
   }
 
   // bullets
-  ctx.fillStyle = 'yellow';
   for(let b of bullets){
-    ctx.beginPath(); ctx.arc(b.x, b.y, upgrades.bigger ? 5 : 3, 0, Math.PI*2); ctx.fill();
+    const baseRadius = 3;
+    const radius = baseRadius * (1 + 0.10 * upgrades.bigger);
+    ctx.fillStyle = 'yellow';
+    ctx.beginPath(); ctx.arc(b.x, b.y, radius, 0, Math.PI*2); ctx.fill();
   }
 
   // boost effect / glow
@@ -544,7 +588,6 @@ function render(){
   ctx.fillStyle = '#AEEAFF';
   ctx.fillRect(-20, -10, 40, 20);
   if(keys['ArrowUp']){
-    // visual thruster intensity based on thrustApplied / thrustBase
     const thr = rocket.thrustApplied / rocket.thrustBase;
     ctx.fillStyle = 'orange';
     ctx.beginPath();
@@ -569,7 +612,6 @@ window.addEventListener('keydown', e=>{
   if(e.code === 'KeyR'){
     if(gameOver) restartGame();
     else {
-      // quick restart mid-game
       restartGame();
     }
   }
@@ -583,22 +625,30 @@ function updateUI(){
   killsUi.textContent = `Kills: ${killCount} | Level: ${level}`;
   boostUi.textContent = boostReady ? 'Boost: READY' : `Boost: ${Math.max(0, Math.ceil((BOOST_COOLDOWN - (performance.now()-lastBoostAt))/1000))}s`;
   metaUi.textContent = `Max Missiles: ${missileCap} (cap ${missileCapMax}) | Missile Speed Bonus: ${baseDifficultySpeedBonus.toFixed(2)}`;
+  // upgrades summary
+  const parts = [];
+  for(const k in upgrades){
+    if(upgrades[k]) parts.push(`${k}: ${upgrades[k]}`);
+  }
+  upgradesUi.textContent = `Upgrades: ${parts.length? parts.join(' | ') : '—'}`;
 }
 
 /* -------------------------
    Restart
    ------------------------- */
 function restartGame(){
-  // reset core state AND reset upgrades so powerups don't persist after death (problem #1 fix)
+  // reset core state
   rocket.x = canvas.width/2; rocket.y = canvas.height/2; rocket.vx = 0; rocket.vy = 0; rocket.angle = 0;
   bullets = []; missiles = [];
+  // reset magazine to base magSize (we keep magSize default unless addMaxAmmo had been picked — requirement said upgrades reset on death)
+  magSize = 10;
   bulletsInMag = magSize; reloading = false;
   killCount = 0; killsSinceLevel = 0; level = 1;
   missileCap = startingMissileCap; baseDifficultySpeedBonus = 0;
-  // RESET UPGRADES (user wanted them to restart on death)
-  upgrades = { multishot:false, bigger:false, fasterFire:false, homingBullets:false, piercing:false };
+  // RESET UPGRADES to zero
+  upgrades = { multishot:0, bigger:0, fasterFire:0, homingBullets:0, piercing:0, addAmmo:0, addMaxAmmo:0 };
   // reset related vars
-  magSize = 10; bulletsInMag = magSize; fireRate = BASE_FIRE_RATE; maxAmmo = BASE_MAX_AMMO;
+  fireRate = BASE_FIRE_RATE; maxAmmo = BASE_MAX_AMMO;
   gameOver = false; gameOverEl.style.display = 'none';
   pausedForUpgrade = false; overlay.classList.remove('show');
   boostReady = true; boostCharge = 0;
