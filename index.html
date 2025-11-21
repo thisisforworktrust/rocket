@@ -1,0 +1,610 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Velocity Void — Merged (Option A)</title>
+<style>
+  html,body{height:100%;margin:0;background:#030417;color:#dfefff;font-family:monospace;overflow:hidden}
+  canvas{display:block}
+  #ui{position:absolute;left:12px;top:12px;font-size:15px;z-index:5}
+  #ui div{margin-bottom:6px}
+  #overlay{
+    position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:rgba(0,0,0,0.6);color:#fff;z-index:10;backdrop-filter:blur(2px);
+    visibility:hidden;opacity:0;transition:opacity .15s;
+  }
+  #panel{background:#071124;padding:18px;border-radius:10px;border:2px solid rgba(126,211,255,0.12);width:520px;text-align:center}
+  #panel h2{margin:0 0 12px;font-size:22px}
+  .choices{display:flex;gap:12px;justify-content:center}
+  .choice{flex:1;padding:12px;border-radius:8px;background:#081827;cursor:pointer;border:2px solid rgba(255,255,255,0.04)}
+  .choice:hover{border-color:#7dd3fc}
+  .choice h3{margin:0 0 6px;font-size:16px}
+  .small{font-size:13px;color:#9fb7c8}
+  #overlay.show{visibility:visible;opacity:1}
+  #msg{position:fixed;right:12px;top:12px;color:#cfefff;font-size:13px}
+  #gameOver{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);color:#fff;font-size:28px;z-index:12;display:none}
+  button { cursor:pointer; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <div id="ammoUi">Ammo: 12</div>
+  <div id="killsUi">Kills: 0</div>
+  <div id="boostUi">Boost: READY</div>
+  <div id="metaUi">Max Missiles: 3 | Missile Speed: 2.4</div>
+</div>
+
+<div id="overlay"><div id="panel">
+  <h2>LEVEL UP!</h2>
+  <div class="small">Pick one upgrade:</div>
+  <div class="choices" id="choices"></div>
+  <div style="margin-top:12px;color:#9fb7c8;font-size:13px">Game is paused during selection</div>
+</div></div>
+
+<div id="msg">Hold ⇧ to charge boost — Release to burst. Use Arrow keys to steer, Space to shoot. R to restart.</div>
+<div id="gameOver">YOU DIED — Press R to restart</div>
+<canvas id="c"></canvas>
+
+<script>
+/* -------------------------
+   Configuration / Globals
+   ------------------------- */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+function fit(){ canvas.width = innerWidth; canvas.height = innerHeight; }
+fit(); window.addEventListener('resize', ()=>{ fit(); makeStars(); });
+
+const overlay = document.getElementById('overlay');
+const choicesEl = document.getElementById('choices');
+const ammoUi = document.getElementById('ammoUi');
+const killsUi = document.getElementById('killsUi');
+const boostUi = document.getElementById('boostUi');
+const metaUi = document.getElementById('metaUi');
+const gameOverEl = document.getElementById('gameOver');
+
+let keys = {};
+addEventListener('keydown', e=>{ keys[e.code] = true; });
+addEventListener('keyup', e=>{ keys[e.code] = false; });
+
+let gameOver = false;
+let pausedForUpgrade = false;
+
+let killCount = 0;
+let killsSinceLevel = 0;
+let level = 1;
+
+/* player */
+const PLAYER_MAX_SPEED = 7;      // user's requested cap
+let rocket = {
+  x: canvas.width/2, y: canvas.height/2,
+  vx: 0, vy: 0, angle: 0,
+  thrust: 0.26, rotationSpeed: 0.07, drag: 0.99
+};
+
+/* magazine & reload */
+const BASE_MAX_AMMO = 12;
+let maxAmmo = BASE_MAX_AMMO;
+let ammo = maxAmmo;
+const BASE_RELOAD = 1500;
+let reloadTime = BASE_RELOAD;
+let reloading = false;
+const BASE_FIRE_RATE = 150;
+let fireRate = BASE_FIRE_RATE;
+let lastShotTime = 0;
+let magSize = 10;
+let bulletsInMag = magSize;
+
+/* boost */
+let boosting = false;
+let boostCharge = 0;
+const BOOST_CHARGE_TIME = 900;
+let boostReady = true;
+const BOOST_COOLDOWN = 4000;
+let lastBoostAt = -9999;
+
+/* bullets & missiles */
+let bullets = [];
+let missiles = [];
+
+/* missile cap & scaling */
+let startingMissileCap = 3;
+let missileCap = startingMissileCap;          // current allowed count
+const missileCapMax = 15;                     // hard cap
+let baseDifficultySpeedBonus = 0;             // increases every 5 kills
+
+/* upgrade state */
+let upgrades = {
+  multishot:false,
+  bigger:false,
+  fasterFire:false,
+  homingBullets:false,
+  piercing:false
+};
+
+/* missile types base speeds */
+const BASE_TYPE_SPEED = { basic:2.4, burner:3.4, smart:2.6, cluster:2.2 };
+
+/* starfield for background */
+let starCanvas = null;
+function makeStars(){
+  starCanvas = document.createElement('canvas');
+  starCanvas.width = canvas.width; starCanvas.height = canvas.height;
+  const sctx = starCanvas.getContext('2d');
+  sctx.fillStyle = '#030417';
+  sctx.fillRect(0,0,starCanvas.width,starCanvas.height);
+  for(let i=0;i<180;i++){
+    sctx.fillStyle = `rgba(255,255,255,${Math.random()*0.6})`;
+    sctx.fillRect(Math.random()*starCanvas.width, Math.random()*starCanvas.height, Math.random()*2+0.3, Math.random()*2+0.3);
+  }
+}
+makeStars();
+
+/* --- Utilities --- */
+function rand(a,b){ return a + Math.random()*(b-a); }
+function len(x,y){ return Math.hypot(x,y); }
+function clamp(n,a,b){ return Math.max(a, Math.min(b,n)); }
+
+/* -------------------------
+   Spawning & Difficulty
+   ------------------------- */
+let spawnTimer = 0;
+const BASE_SPAWN_INTERVAL = 0.6; // seconds
+
+function pickMissileType(){
+  const r = Math.random();
+  if(r < 0.6) return 'basic';
+  if(r < 0.8) return 'burner';
+  if(r < 0.92) return 'smart';
+  return 'cluster';
+}
+
+function spawnMissile(){
+  if(missiles.length >= missileCap) return; // enforce cap
+  const side = Math.floor(Math.random()*4);
+  let x,y;
+  if(side===0){ x=-60; y=rand(0,canvas.height); }
+  else if(side===1){ x=canvas.width+60; y=rand(0,canvas.height); }
+  else if(side===2){ x=rand(0,canvas.width); y=-60; }
+  else { x=rand(0,canvas.width); y=canvas.height+60; }
+  const type = pickMissileType();
+  const baseSpeed = BASE_TYPE_SPEED[type];
+  // scale missile speed with difficulty bonus
+  const speed = baseSpeed + baseDifficultySpeedBonus;
+  missiles.push({ x,y, vx:0, vy:0, type, speed, age:0 });
+}
+
+/* -------------------------
+   Shooting / Bullets
+   ------------------------- */
+function startReload(){
+  if(reloading) return;
+  reloading = true;
+  setTimeout(()=>{ bulletsInMag = magSize; reloading = false; updateUI(); }, reloadTime);
+}
+
+function shootNow(){
+  const now = performance.now();
+  if(now - lastShotTime < fireRate) return;
+  if(reloading) return;
+  if(bulletsInMag <= 0){ startReload(); return; }
+  lastShotTime = now;
+
+  const shots = upgrades.multishot ? 2 : 1;
+  const spread = upgrades.multishot ? 0.12 : 0;
+  for(let i=0;i<shots;i++){
+    const t = shots===1 ? 0.5 : i/(shots-1 || 1);
+    const a = rocket.angle + ( (t-0.5) * spread ) * (Math.random()*0.9 + 0.1);
+    const speed = upgrades.bigger ? 16 : 12;
+    bullets.push({
+      x: rocket.x + Math.cos(a)*22,
+      y: rocket.y + Math.sin(a)*22,
+      vx: Math.cos(a)*speed,
+      vy: Math.sin(a)*speed,
+      life: 90,
+      piercing: upgrades.piercing,
+      homing: upgrades.homingBullets
+    });
+  }
+
+  bulletsInMag--;
+  if(bulletsInMag <= 0) startReload();
+  updateUI();
+}
+
+/* -------------------------
+   Upgrades / Leveling
+   ------------------------- */
+const ALL_UPGRADES = [
+  { id:'multishot', name:'Multi-shot', desc:'Fire two shots at once' },
+  { id:'bigger', name:'Bigger Bullets', desc:'Bullets travel farther & hitbox bigger' },
+  { id:'fasterFire', name:'Faster Fire Rate', desc:'Decrease time between shots' },
+  { id:'homingBullets', name:'Homing Bullets', desc:'Bullets curve toward missiles' },
+  { id:'piercing', name:'Piercing Shot', desc:'Bullets pierce one extra missile' }
+];
+
+function offerUpgrade(){
+  pausedForUpgrade = true;
+  overlay.classList.add('show');
+  choicesEl.innerHTML = '';
+  let pool = [...ALL_UPGRADES];
+  pool.sort((a,b)=> (upgrades[a.id]?1:0) - (upgrades[b.id]?1:0));
+  const opts = [];
+  while(opts.length < 3 && pool.length){
+    const idx = Math.floor(Math.random()*pool.length);
+    opts.push(pool.splice(idx,1)[0]);
+  }
+  opts.forEach(o=>{
+    const div = document.createElement('div');
+    div.className = 'choice';
+    div.innerHTML = `<h3>${o.name}</h3><div class="small">${o.desc}</div>`;
+    div.onclick = ()=>{
+      applyUpgrade(o.id);
+      overlay.classList.remove('show');
+      pausedForUpgrade = false;
+    };
+    choicesEl.appendChild(div);
+  });
+}
+
+function applyUpgrade(id){
+  if(id === 'multishot') upgrades.multishot = true;
+  if(id === 'bigger') { upgrades.bigger = true; magSize = Math.min(18, magSize + 2); bulletsInMag = Math.min(bulletsInMag, magSize); }
+  if(id === 'fasterFire') { upgrades.fasterFire = true; fireRate = Math.max(60, Math.floor(BASE_FIRE_RATE * 0.6)); }
+  if(id === 'homingBullets') upgrades.homingBullets = true;
+  if(id === 'piercing') upgrades.piercing = true;
+  updateUI();
+}
+
+/* -------------------------
+   Collisions & Game Logic
+   ------------------------- */
+function bulletHitsMissile(b,m){
+  const hitRadius = (m.type==='cluster'?18:16) + (upgrades.bigger?2:0);
+  return Math.hypot(b.x - m.x, b.y - m.y) < hitRadius;
+}
+
+function killMissile(i){
+  const m = missiles[i];
+  if(!m) return;
+  // cluster explosion spawn baby basics
+  if(m.type === 'cluster'){
+    for(let k=0;k<3;k++){
+      missiles.push({
+        x: m.x + rand(-8,8),
+        y: m.y + rand(-8,8),
+        vx: rand(-1,1),
+        vy: rand(-1,1),
+        type: 'basic',
+        speed: BASE_TYPE_SPEED.basic + baseDifficultySpeedBonus * 0.8,
+        age: 0
+      });
+    }
+  }
+  missiles.splice(i,1);
+  killCount++; killsSinceLevel++;
+  updateDifficultyAndLevel();
+  updateUI();
+}
+
+function updateDifficultyAndLevel(){
+  // every 5 kills: increase missile cap by 1 up to missileCapMax and give a small speed bump
+  if(killCount % 5 === 0){
+    missileCap = Math.min(missileCap + 1, missileCapMax);
+    baseDifficultySpeedBonus += 0.25;
+  }
+  // Every 5 kills also triggers level-up upgrade selection
+  if(killsSinceLevel >= 5){
+    killsSinceLevel = 0;
+    level++;
+    offerUpgrade();
+  }
+}
+
+/* -------------------------
+   Update Loop
+   ------------------------- */
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(0.04, (now - last) / 1000);
+  last = now;
+  if(!pausedForUpgrade) update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+function update(dt){
+  if(gameOver) return;
+
+  // controls
+  if(keys['ArrowLeft']) rocket.angle -= rocket.rotationSpeed;
+  if(keys['ArrowRight']) rocket.angle += rocket.rotationSpeed;
+  if(keys['ArrowUp']) { rocket.vx += Math.cos(rocket.angle) * rocket.thrust; rocket.vy += Math.sin(rocket.angle) * rocket.thrust; }
+  if(keys['ArrowDown']) { rocket.vx *= 0.96; rocket.vy *= 0.96; }
+
+  // shooting (Space on hold works via keydown or spacebar handler)
+  if(keys['Space'] && !pausedForUpgrade) shootNow();
+
+  // boost charge (hold Shift)
+  if((keys['ShiftLeft'] || keys['ShiftRight']) && boostReady){
+    boostCharge += dt * (1000 / BOOST_CHARGE_TIME);
+    if(boostCharge > 1) boostCharge = 1;
+    boosting = true;
+  } else if(boosting){
+    boosting = false;
+    if(boostCharge > 0.12 && boostReady){
+      const power = 6 + boostCharge * 14;
+      rocket.vx += Math.cos(rocket.angle) * power;
+      rocket.vy += Math.sin(rocket.angle) * power;
+      boostReady = false;
+      lastBoostAt = performance.now();
+      setTimeout(()=>{ boostReady = true; updateUI(); }, BOOST_COOLDOWN);
+    }
+    boostCharge = 0;
+  }
+
+  // apply drag then cap speed
+  rocket.vx *= rocket.drag; rocket.vy *= rocket.drag;
+  let speed = Math.hypot(rocket.vx, rocket.vy);
+  if(speed > PLAYER_MAX_SPEED){
+    rocket.vx = (rocket.vx / speed) * PLAYER_MAX_SPEED;
+    rocket.vy = (rocket.vy / speed) * PLAYER_MAX_SPEED;
+  }
+
+  rocket.x += rocket.vx; rocket.y += rocket.vy;
+
+  // wrap player
+  if(rocket.x < 0) rocket.x = canvas.width;
+  if(rocket.x > canvas.width) rocket.x = 0;
+  if(rocket.y < 0) rocket.y = canvas.height;
+  if(rocket.y > canvas.height) rocket.y = 0;
+
+  // bullets update
+  for(let b of bullets){
+    // homing bullets nudge toward nearest missile
+    if(b.homing && missiles.length){
+      let nearest = null, nd = 1e9;
+      for(let m of missiles){
+        const d = len(m.x - b.x, m.y - b.y);
+        if(d < nd){ nd = d; nearest = m; }
+      }
+      if(nearest){
+        const dx = nearest.x - b.x, dy = nearest.y - b.y;
+        const d = Math.hypot(dx,dy) || 1;
+        b.vx += (dx/d) * 0.12; b.vy += (dy/d) * 0.12;
+        const mag = Math.hypot(b.vx, b.vy) || 1;
+        const sp = upgrades.bigger ? 16 : 12;
+        b.vx = (b.vx / mag) * sp;
+        b.vy = (b.vy / mag) * sp;
+      }
+    }
+    b.x += b.vx; b.y += b.vy; b.life--;
+  }
+
+  // remove bullets offscreen or expired (no looping)
+  bullets = bullets.filter(b => b.life > 0 && b.x >= 0 && b.x <= canvas.width && b.y >= 0 && b.y <= canvas.height);
+
+  // spawn missiles over time (respect spawn cap)
+  spawnTimer += dt;
+  const spawnInterval = Math.max(0.25, BASE_SPAWN_INTERVAL - baseDifficultySpeedBonus * 0.03); // faster spawns as difficulty grows
+  if(spawnTimer > spawnInterval){
+    spawnTimer = 0;
+    spawnMissile();
+  }
+
+  // missile AI update
+  for(let m of missiles){
+    m.age += dt;
+    const dx = rocket.x - m.x, dy = rocket.y - m.y;
+    const dist = Math.hypot(dx,dy) || 1;
+
+    if(m.type === 'basic'){
+      m.vx += (dx/dist) * 0.12;
+      m.vy += (dy/dist) * 0.12;
+      const mag = Math.hypot(m.vx,m.vy) || 1;
+      m.vx = (m.vx / mag) * m.speed;
+      m.vy = (m.vy / mag) * m.speed;
+    } else if(m.type === 'burner'){
+      if(m.age < 0.4){
+        m.vx = (dx/dist) * m.speed * 0.6;
+        m.vy = (dy/dist) * m.speed * 0.6;
+      } else {
+        m.vx += (dx/dist) * 0.06; m.vy += (dy/dist) * 0.06;
+        const mag = Math.hypot(m.vx,m.vy) || 1;
+        m.vx = (m.vx/mag) * m.speed; m.vy = (m.vy/mag) * m.speed;
+      }
+    } else if(m.type === 'smart'){
+      const predictT = Math.min(60, dist / (m.speed + 0.5)) * 0.12;
+      const targetX = rocket.x + rocket.vx * (predictT * 40);
+      const targetY = rocket.y + rocket.vy * (predictT * 40);
+      const dx2 = targetX - m.x, dy2 = targetY - m.y;
+      const d2 = Math.hypot(dx2,dy2) || 1;
+      m.vx += (dx2/d2) * 0.16; m.vy += (dy2/d2) * 0.16;
+      const mag = Math.hypot(m.vx,m.vy) || 1;
+      m.vx = (m.vx/mag) * m.speed; m.vy = (m.vy/mag) * m.speed;
+    } else if(m.type === 'cluster'){
+      m.vx += (dx/dist) * 0.10; m.vy += (dy/dist) * 0.10;
+      const mag = Math.hypot(m.vx,m.vy) || 1;
+      m.vx = (m.vx/mag) * m.speed; m.vy = (m.vy/mag) * m.speed;
+    }
+
+    m.x += m.vx; m.y += m.vy;
+
+    // wrap missiles
+    if(m.x < 0) m.x = canvas.width;
+    if(m.x > canvas.width) m.x = 0;
+    if(m.y < 0) m.y = canvas.height;
+    if(m.y > canvas.height) m.y = 0;
+  }
+
+  // bullet hits missile
+  for(let i = missiles.length - 1; i >= 0; i--){
+    const m = missiles[i];
+    for(let j = bullets.length - 1; j >= 0; j--){
+      const b = bullets[j];
+      if(bulletHitsMissile(b,m)){
+        // bullet consumes some life; simple model: piercing bullets lose less life
+        if(b.piercing){
+          b.life -= 20; // can hit multiple
+        } else {
+          b.life = -1; // consumed
+        }
+        // if cluster, spawn babies then remove missile
+        if(m.type === 'cluster'){
+          for(let k=0;k<3;k++){
+            missiles.push({
+              x: m.x + rand(-8,8),
+              y: m.y + rand(-8,8),
+              vx: rand(-1,1),
+              vy: rand(-1,1),
+              type: 'basic',
+              speed: BASE_TYPE_SPEED.basic + baseDifficultySpeedBonus * 0.8,
+              age:0
+            });
+          }
+        }
+        missiles.splice(i,1);
+        killCount++; killsSinceLevel++;
+        updateDifficultyAndLevel();
+        updateUI();
+        break;
+      }
+    }
+  }
+
+  // bullets can hit player (self-hit)
+  for(let b of bullets){
+    if(len(b.x - rocket.x, b.y - rocket.y) < (upgrades.bigger ? 18 : 14)){
+      // death by own bullet
+      onDeath();
+      return;
+    }
+  }
+  // missiles hit player
+  for(let m of missiles){
+    if(len(m.x - rocket.x, m.y - rocket.y) < 22){
+      onDeath();
+      return;
+    }
+  }
+
+  // UI tick
+  updateUI();
+}
+
+/* -------------------------
+   Death / Restart
+   ------------------------- */
+function onDeath(){
+  gameOver = true;
+  gameOverEl.style.display = 'block';
+  // keep stats visible but freeze gameplay
+}
+
+/* -------------------------
+   Rendering
+   ------------------------- */
+function render(){
+  // background
+  ctx.drawImage(starCanvas, 0, 0);
+
+  // missiles
+  for(let m of missiles){
+    if(m.type === 'burner'){
+      ctx.fillStyle = 'rgba(255,120,50,0.95)';
+      ctx.beginPath(); ctx.ellipse(m.x - m.vx*2, m.y - m.vy*2, 8,4,0,0,Math.PI*2); ctx.fill();
+    } else if(m.type === 'smart'){
+      ctx.fillStyle = 'rgba(220,60,160,0.95)';
+    } else if(m.type === 'cluster'){
+      ctx.fillStyle = 'rgba(200,90,40,0.95)';
+    } else {
+      ctx.fillStyle = 'rgba(220,40,40,0.95)';
+    }
+    ctx.beginPath(); ctx.arc(m.x, m.y, m.type==='cluster'?13:10, 0, Math.PI*2); ctx.fill();
+  }
+
+  // bullets
+  ctx.fillStyle = 'yellow';
+  for(let b of bullets){
+    ctx.beginPath(); ctx.arc(b.x, b.y, upgrades.bigger ? 5 : 3, 0, Math.PI*2); ctx.fill();
+  }
+
+  // boost effect / glow
+  if(boostCharge > 0){
+    const g = 0.12 + 0.6 * boostCharge;
+    ctx.save();
+    ctx.translate(rocket.x, rocket.y);
+    ctx.rotate(rocket.angle);
+    ctx.fillStyle = `rgba(180,230,255,${g})`;
+    ctx.beginPath(); ctx.ellipse(0,0, 36 + boostCharge*28, 18 + boostCharge*14, 0, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  // rocket
+  ctx.save();
+  ctx.translate(rocket.x, rocket.y);
+  ctx.rotate(rocket.angle);
+  ctx.fillStyle = '#AEEAFF';
+  ctx.fillRect(-20, -10, 40, 20);
+  if(keys['ArrowUp']){
+    ctx.fillStyle = 'orange';
+    ctx.beginPath();
+    ctx.moveTo(-20, -8);
+    ctx.lineTo(-34 - Math.random()*6, 0);
+    ctx.lineTo(-20, 8);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+/* -------------------------
+   Input: space fires on keydown, r restarts
+   ------------------------- */
+window.addEventListener('keydown', e=>{
+  if(e.code === 'Space'){ e.preventDefault(); if(!pausedForUpgrade) shootNow(); }
+  if(e.code === 'KeyR'){
+    if(gameOver) restartGame();
+    else {
+      // quick restart mid-game (optional)
+      restartGame();
+    }
+  }
+});
+
+/* -------------------------
+   UI
+   ------------------------- */
+function updateUI(){
+  ammoUi.textContent = `Ammo: ${bulletsInMag}/${magSize} ${reloading ? '(reloading)' : ''}`;
+  killsUi.textContent = `Kills: ${killCount} | Level: ${level}`;
+  boostUi.textContent = boostReady ? 'Boost: READY' : `Boost: ${Math.max(0, Math.ceil((BOOST_COOLDOWN - (performance.now()-lastBoostAt))/1000))}s`;
+  metaUi.textContent = `Max Missiles: ${missileCap} (cap ${missileCapMax}) | Missile Speed Bonus: ${baseDifficultySpeedBonus.toFixed(2)}`;
+}
+
+/* -------------------------
+   Restart
+   ------------------------- */
+function restartGame(){
+  // reset core state but keep chosen upgrades (you could clear upgrades too if desired)
+  rocket.x = canvas.width/2; rocket.y = canvas.height/2; rocket.vx = 0; rocket.vy = 0; rocket.angle = 0;
+  bullets = []; missiles = [];
+  bulletsInMag = magSize; reloading = false;
+  killCount = 0; killsSinceLevel = 0; level = 1;
+  missileCap = startingMissileCap; baseDifficultySpeedBonus = 0;
+  gameOver = false; gameOverEl.style.display = 'none';
+  pausedForUpgrade = false; overlay.classList.remove('show');
+  updateUI();
+}
+
+/* -------------------------
+   Kickoff
+   ------------------------- */
+updateUI();
+requestAnimationFrame(frame);
+
+/* -------------------------
+   End of script
+   ------------------------- */
+</script>
+</body>
+</html>
