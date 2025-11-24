@@ -123,7 +123,11 @@ let upgrades = {
   homingBullets: 0,   // +0.06 steering per level
   piercing: 0,        // +1 pierce per level
   addAmmo: 0,         // +1 loaded ammo when picked
-  addMaxAmmo: 0       // +2 magSize per pick
+  addMaxAmmo: 0,      // +2 magSize per pick
+  shield: 0,          // new: shield picks (activates on pickup)
+  explosive: 0,       // new: explosive bullets
+  ricochet: 0,        // new: bullets bounce once
+  drone: 0            // new: drone ally
 };
 
 /* missile types base speeds */
@@ -217,7 +221,8 @@ function shootNow(){
       vy: Math.sin(a)*baseBulletSpeed,
       life: baseLife,
       pierce: upgrades.piercing,              // how many extra missiles it can pass through
-      homing: upgrades.homingBullets > 0
+      homing: upgrades.homingBullets > 0,
+      bounced: false // for ricochet tracking
     });
     // recoil per shot (smaller with multishot)
     const recoilStrength = 0.65 * (baseBulletSpeed / 12) * (shots === 1 ? 1 : 0.55);
@@ -240,7 +245,11 @@ const ALL_UPGRADES = [
   { id:'homingBullets', name:'Homing Bullets', desc:'Bullets curve toward missiles (stronger each upgrade)' },
   { id:'piercing', name:'Piercing Shot', desc:'+1 pierce per upgrade' },
   { id:'addAmmo', name:'+Ammo', desc:'Add +1 loaded ammo (not above magazine size)' },
-  { id:'addMaxAmmo', name:'Increase Mag Size', desc:'+2 magazine size per upgrade' }
+  { id:'addMaxAmmo', name:'Increase Mag Size', desc:'+2 magazine size per upgrade' },
+  { id:'shield', name:'Shield', desc:'Gain temporary invulnerability for 3s when picked' },
+  { id:'explosive', name:'Explosive Bullets', desc:'Bullets explode on impact, damaging nearby missiles' },
+  { id:'ricochet', name:'Ricochet', desc:'Bullets bounce once off screen edges' },
+  { id:'drone', name:'Drone Ally', desc:'Summon a drone that auto-fires weak bullets' }
 ];
 
 function offerUpgrade(){
@@ -269,6 +278,27 @@ function offerUpgrade(){
   });
 }
 
+/* -------------------------
+   New: shield / drone state
+   ------------------------- */
+let shieldActive = false;
+function activateShield(){
+  shieldActive = true;
+  // show a subtle visual cue for shield (we rely on the boost glow + bullet draw)
+  setTimeout(()=>shieldActive = false, 3000);
+}
+
+/* Drone state */
+let drone = null; // {x,y, timer}
+function spawnDrone(){
+  if(!drone){
+    drone = { x: rocket.x + 40, y: rocket.y, timer: 0 };
+  }
+}
+
+/* -------------------------
+   applyUpgrade: extended handling
+   ------------------------- */
 function applyUpgrade(id){
   // increase the counter
   upgrades[id] = (upgrades[id] || 0) + 1;
@@ -289,6 +319,15 @@ function applyUpgrade(id){
   if(id === 'fasterFire'){
     // recompute fireRate using computeFireRate()
     fireRate = computeFireRate();
+  }
+
+  if(id === 'shield'){
+    // give immediate activation on pickup
+    activateShield();
+  }
+
+  if(id === 'drone'){
+    spawnDrone();
   }
 
   // update UI
@@ -394,6 +433,12 @@ function update(dt){
 
   // bullets update
   for(let b of bullets){
+    // ricochet logic: bounce once off screen edges if upgrade > 0
+    if(upgrades.ricochet > 0 && !b.bounced){
+      if(b.x < 0 || b.x > canvas.width){ b.vx *= -1; b.bounced = true; }
+      if(b.y < 0 || b.y > canvas.height){ b.vy *= -1; b.bounced = true; }
+    }
+
     if(b.homing && missiles.length){
       let nearest = null, nd = 1e9;
       for(let m of missiles){
@@ -416,7 +461,7 @@ function update(dt){
   }
 
   // remove bullets offscreen or expired
-  bullets = bullets.filter(b => b.life > 0 && b.x >= -40 && b.x <= canvas.width+40 && b.y >= -40 && b.y <= canvas.height+40);
+  bullets = bullets.filter(b => b.life > 0 && b.x >= -80 && b.x <= canvas.width+80 && b.y >= -80 && b.y <= canvas.height+80);
 
   // spawn missiles
   spawnTimer += dt;
@@ -474,9 +519,12 @@ function update(dt){
   // bullet hits missile
   for(let i = missiles.length - 1; i >= 0; i--){
     const m = missiles[i];
+    let hit = false;
     for(let j = bullets.length - 1; j >= 0; j--){
       const b = bullets[j];
       if(bulletHitsMissile(b,m)){
+        hit = true;
+
         // handle piercing: if bullet has pierce (count), decrement and reduce life; otherwise kill bullet
         if(b.pierce && b.pierce > 0){
           b.pierce--;
@@ -500,12 +548,32 @@ function update(dt){
           }
         }
 
+        // remove the hit missile
         missiles.splice(i,1);
         killCount++; killsSinceLevel++;
         updateDifficultyAndLevel();
         updateUI();
+
+        // EXPLOSIVE: damage nearby missiles when explosive upgrade present
+        if(upgrades.explosive > 0){
+          const radius = 40 + upgrades.explosive * 10;
+          // iterate backwards to safely remove
+          for(let k = missiles.length - 1; k >= 0; k--){
+            const m2 = missiles[k];
+            if(Math.hypot(m2.x - m.x, m2.y - m.y) < radius){
+              missiles.splice(k,1);
+              killCount++; killsSinceLevel++;
+            }
+          }
+          updateDifficultyAndLevel();
+          updateUI();
+        }
+
         break;
       }
+    }
+    if(hit) {
+      // break outer loop iteration is handled by splice(i,1) above; continue
     }
   }
 
@@ -526,6 +594,27 @@ function update(dt){
     }
   }
 
+  // Drone behavior: follow and auto-fire
+  if(drone){
+    drone.x = rocket.x + 40;
+    drone.y = rocket.y;
+    drone.timer += dt;
+    if(drone.timer > 1.0){
+      drone.timer = 0;
+      // auto-fire weak bullets
+      bullets.push({
+        x: drone.x,
+        y: drone.y,
+        vx: Math.cos(rocket.angle) * 8 + rand(-0.4,0.4),
+        vy: Math.sin(rocket.angle) * 8 + rand(-0.4,0.4),
+        life: 60,
+        pierce: 0,
+        homing: false,
+        bounced: false
+      });
+    }
+  }
+
   // UI tick
   updateUI();
 }
@@ -534,6 +623,10 @@ function update(dt){
    Death / Restart
    ------------------------- */
 function onDeath(){
+  if(shieldActive){
+    // ignore death while shield is active
+    return;
+  }
   gameOver = true;
   gameOverEl.style.display = 'block';
   pausedForUpgrade = false;
@@ -581,12 +674,29 @@ function render(){
     ctx.restore();
   }
 
+  // drone render
+  if(drone){
+    ctx.fillStyle = '#88f';
+    ctx.beginPath(); ctx.arc(drone.x, drone.y, 6, 0, Math.PI*2); ctx.fill();
+    // small antenna
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.beginPath(); ctx.moveTo(drone.x, drone.y-6); ctx.lineTo(drone.x, drone.y-12); ctx.stroke();
+  }
+
   // rocket
   ctx.save();
   ctx.translate(rocket.x, rocket.y);
   ctx.rotate(rocket.angle);
   ctx.fillStyle = '#AEEAFF';
   ctx.fillRect(-20, -10, 40, 20);
+
+  // shield visual if active
+  if(shieldActive){
+    ctx.strokeStyle = 'rgba(150,220,255,0.6)';
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(0,0,30,0,Math.PI*2); ctx.stroke();
+  }
+
   if(keys['ArrowUp']){
     const thr = rocket.thrustApplied / rocket.thrustBase;
     ctx.fillStyle = 'orange';
@@ -610,10 +720,7 @@ function render(){
 window.addEventListener('keydown', e=>{
   if(e.code === 'Space'){ e.preventDefault(); if(!pausedForUpgrade) shootNow(); }
   if(e.code === 'KeyR'){
-    if(gameOver) restartGame();
-    else {
-      restartGame();
-    }
+    restartGame();
   }
 });
 
@@ -645,13 +752,15 @@ function restartGame(){
   bulletsInMag = magSize; reloading = false;
   killCount = 0; killsSinceLevel = 0; level = 1;
   missileCap = startingMissileCap; baseDifficultySpeedBonus = 0;
-  // RESET UPGRADES to zero
-  upgrades = { multishot:0, bigger:0, fasterFire:0, homingBullets:0, piercing:0, addAmmo:0, addMaxAmmo:0 };
+  // RESET UPGRADES to zero (including newly added ones)
+  upgrades = { multishot:0, bigger:0, fasterFire:0, homingBullets:0, piercing:0, addAmmo:0, addMaxAmmo:0, shield:0, explosive:0, ricochet:0, drone:0 };
   // reset related vars
   fireRate = BASE_FIRE_RATE; maxAmmo = BASE_MAX_AMMO;
   gameOver = false; gameOverEl.style.display = 'none';
   pausedForUpgrade = false; overlay.classList.remove('show');
   boostReady = true; boostCharge = 0;
+  shieldActive = false;
+  drone = null;
   updateUI();
 }
 
